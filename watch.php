@@ -1,11 +1,15 @@
 #!/usr/bin/env php
 <?php
+
 /**
  * Hyperf Watch Hot Reload Scripts
- * User: hanicc@qq.com
- * Date: 2019/11/12
- * Time: 下午16:00
- * Modify From https://github.com/leocavalcante/dwoole/blob/master/dev/watch.php
+ * From: https://github.com/ha-ni-cc/hyperf-watch
+ * Author: hanicc@qq.com
+ * Usage:
+ * Open the terminal console in the project root directory and enter：php watch
+ * 在项目根目录下打开终端控制台，输入：php watch
+ * If you want to clean the /runtime/container cache, enter: php watch -c
+ * 如果你想要清除/runtime/container缓存，则输入：php watch -c
  */
 
 # PHP Bin File PHP程序所在路径（默认自动获取）
@@ -15,44 +19,88 @@ const WATCH_DIR = __DIR__ . '/';
 # Watch Ext 监听扩展名（多个可用英文逗号隔开）
 const WATCH_EXT = 'php,env';
 # Exclude Dir 排除目录（不监听的目录，数组形式)
-const EXCLUDE_DIR = ['vendor'];
+const EXCLUDE_DIR = ['vendor', 'runtime','logs', 'public'];
 # Entry Point File 入口文件
-const ENTRY_POINT_FILE = './bin/hyperf.php';
+const ENTRY_POINT_FILE = __DIR__ . '/bin/hyperf.php';
+# Start Command 启动命令
+const START_COMMAND = [ENTRY_POINT_FILE, 'start'];
+# PID File Path PID文件路径
+const PID_FILE_PATH = __DIR__ . '/runtime/hyperf.pid';
 # Scan Interval 扫描间隔（毫秒，默认2000）
 const SCAN_INTERVAL = 2000;
+# Console Color 控制台颜色
+const CONSOLE_COLOR_DEFAULT = "\033[0m";
+const CONSOLE_COLOR_RED = "\033[0;31m";
+const CONSOLE_COLOR_GREEN = "\033[0;32m";
+const CONSOLE_COLOR_YELLOW = "\033[0;33m";
+const CONSOLE_COLOR_BLUE = "\033[0;34m";
 
 if (!function_exists('exec')) {
-    echo "[x] 请取消禁用exec函数" . PHP_EOL;
+    echo '[x] 请在php.ini配置中取消禁用exec方法' . PHP_EOL;
     exit(1);
 }
 
 define('PHP', PHP_BIN_FILE == 'which php' ? exec('which php') : PHP_BIN_FILE);
 
-if (!file_exists(PHP)) {
-    echo "[x] PHP bin (" . PHP . ") 没有找到，请确认路径正确?" . PHP_EOL;
+if (!file_exists(PHP) || !is_executable(PHP)) {
+    echo '[x] PHP bin (" ' . PHP . ' ") 路径没有找到或无法执行，请确认路径正确?' . PHP_EOL;
     exit(1);
 }
 
 if (!file_exists(ENTRY_POINT_FILE)) {
-    echo "[x] 入口文件 (" . ENTRY_POINT_FILE . ") 没有找到，请确认文件存在?" . PHP_EOL;
+    echo '[x] 入口文件 ("' . ENTRY_POINT_FILE . '") 没有找到，请确认文件存在?' . PHP_EOL;
     exit(1);
+}
+
+# 加载env
+$content = @file_get_contents('.env');
+$values = array_filter(preg_split("/(\r\n|\n|\r)/", $content));
+foreach ($values as $val) {
+    if (substr($val, 0, 1) === '#') {
+        continue;
+    }
+    list($name, $value) = explode('=', $val);
+    $_ENV[$name] = $value;
 }
 
 use Swoole\Process;
 use Swoole\Timer;
 use Swoole\Event;
 
-swoole_async_set(['enable_coroutine' => false]);
+swoole_async_set(['enable_coroutine' => false, 'log_level' => SWOOLE_LOG_INFO]);
 $hashes = [];
 $serve = null;
-echo "🚀 Start @ " . date('Y-m-d H:i:s') . PHP_EOL;
-close();
+
+echo CONSOLE_COLOR_YELLOW . "🚀 Start @ " . date('Y-m-d H:i:s') . PHP_EOL;
 start();
 state();
 Timer::tick(SCAN_INTERVAL, 'watch');
 
+function killOldProcess()
+{
+    // pid存在则关闭存在的进程
+    if (file_exists(PID_FILE_PATH) && $pid = @file_get_contents(PID_FILE_PATH)) {
+        if (!@posix_kill($pid)) forceKill();
+    } else forceKill();
+}
+
+function forceKill($match = '')
+{
+    if (!$match) {
+        $match = @$_ENV['APP_NAME'] . '.Master';
+    }
+    // 适配MacOS
+    if (PHP_OS == 'Darwin') $match = ENTRY_POINT_FILE;
+    $command = "ps -ef | grep '$match' | grep -v grep | awk '{print $2}' | xargs kill -9 2>&1";
+    // 找不到pid，强杀进程
+    echo "强杀 $command \n";
+    exec($command);
+}
+
 function start()
 {
+    // 杀旧进程
+    killOldProcess();
     global $serve;
     $serve = new Process('serve', true);
     $serve->start();
@@ -60,25 +108,43 @@ function start()
         echo swoole_strerror(swoole_errno()) . PHP_EOL;
         exit(1);
     }
-    Event::add($serve->pipe, function ($pipe) use (&$serve) {
+    echo "开启".$serve->pid."进程.\n";
+    addEvent($serve);
+}
+
+function addEvent($serve)
+{
+    Event::add($serve->pipe, function () use (&$serve) {
         $message = @$serve->read();
         if (!empty($message)) {
-            echo $message;
+            $debug = strpos($message, '[DEBUG]') !== false;
+            $info = strpos($message, '[INFO]') !== false;
+            $warn = strpos($message, '[WARNING]') !== false;
+            $error = strpos($message, '[ERROR]') !== false;
+            if ($debug) {
+                echo CONSOLE_COLOR_BLUE . $message;
+            } elseif ($info) {
+                echo CONSOLE_COLOR_GREEN . $message;
+            } elseif ($warn) {
+                echo CONSOLE_COLOR_YELLOW . $message;
+            } elseif ($error) {
+                echo CONSOLE_COLOR_RED . $message;
+            } else echo CONSOLE_COLOR_DEFAULT . $message;
+            echo CONSOLE_COLOR_DEFAULT;
         }
     });
-    reWrite($serve->pid);
 }
 
 function watch()
 {
     global $hashes;
-    foreach ($hashes as $pathname => $current_hash) {
-        if (!file_exists($pathname)) {
-            unset($hashes[$pathname]);
+    foreach ($hashes as $pathName => $currentHash) {
+        if (!file_exists($pathName)) {
+            unset($hashes[$pathName]);
             continue;
         }
-        $new_hash = file_hash($pathname);
-        if ($new_hash != $current_hash) {
+        $newHash = fileHash($pathName);
+        if ($newHash != $currentHash) {
             change();
             state();
             break;
@@ -89,46 +155,30 @@ function watch()
 function state()
 {
     global $hashes;
-    $files = php_files(WATCH_DIR);
-    $hashes = array_combine($files, array_map('file_hash', $files));
+    $files = phpFiles(WATCH_DIR);
+    $hashes = array_combine($files, array_map('fileHash', $files));
     $count = count($hashes);
-    echo "📡 Watching $count files..." . PHP_EOL;
+    echo CONSOLE_COLOR_YELLOW . "📡 Watching $count files..." . PHP_EOL;
 }
 
 function change()
 {
     global $serve;
-    echo "🔄 Restart @ " . date('Y-m-d H:i:s') . PHP_EOL;
+    echo CONSOLE_COLOR_YELLOW . "🔄 Restart @ " . date('Y-m-d H:i:s') . PHP_EOL;
+    echo "关闭".$serve->pid."进程.\n";
     Process::kill($serve->pid);
     start();
-}
-
-function reWrite($pid){
-    echo "开启 $pid 进程\n";
-    $myfile = fopen("severPid.env", "w") or die("Unable to open file!");
-    fwrite($myfile, $pid);
-    fclose($myfile);
-}
-
-function close(){
-    $file_path = "severPid.env";
-    if(file_exists($file_path)){
-        $str = file_get_contents($file_path);
-        if(strlen($str)>2)
-          Process::kill($str);
-        echo "关闭 $str 进程\n";
-    }
 }
 
 function serve(Process $serve)
 {
     $opt = getopt('c');
     # if (isset($opt['c'])) echo exec(PHP . ' ' . ENTRY_POINT_FILE . ' di:init-proxy') . '..' . PHP_EOL;
-    if (isset($opt['c'])) del_dir('runtime');
-    $serve->exec(PHP, [ENTRY_POINT_FILE, 'start']);
+    if (isset($opt['c'])) delDir('./runtime/container');
+    $serve->exec(PHP, START_COMMAND);
 }
 
-function file_hash(string $pathname): string
+function fileHash(string $pathname): string
 {
     $contents = file_get_contents($pathname);
     if (false === $contents) {
@@ -137,7 +187,7 @@ function file_hash(string $pathname): string
     return md5($contents);
 }
 
-function php_files(string $dirname): array
+function phpFiles(string $dirname): array
 {
     $directory = new RecursiveDirectoryIterator($dirname);
     $filter = new Filter($directory);
@@ -147,7 +197,7 @@ function php_files(string $dirname): array
     }, iterator_to_array($iterator));
 }
 
-function del_dir($path)
+function delDir($path)
 {
     if (is_dir($path)) {
         //扫描一个目录内的所有目录和文件并返回数组
@@ -159,7 +209,7 @@ function del_dir($path)
                 $sonDir = $path . '/' . $dir;
                 if (is_dir($sonDir)) {
                     //递归删除
-                    del_dir($sonDir);
+                    delDir($sonDir);
                     //目录内的子目录和文件删除后删除空目录
                     @rmdir($sonDir);
                 } else {
